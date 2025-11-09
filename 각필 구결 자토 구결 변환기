@@ -1,0 +1,236 @@
+import openai
+import os
+import base64
+import ast
+import re 
+
+# --- 1. 사용자 설정: API 키 ---
+API_KEY = "YOUR_API_KEY"
+try:
+    openai.api_key = API_KEY
+except ImportError:
+    print("OpenAI 라이브러리가 설치되지 않았습니다. 'pip install openai'를 실행해주세요.")
+    exit()
+
+# --- 2. 핵심 매핑 정보 (제공된 이미지 기반) ---
+
+dot_position_map = {
+    "상단 좌측": "ト",
+    "중앙 좌측": "ヲ",
+    "하단 좌측": "テ",
+    "상단 중앙": "ニ",
+    "중앙 우측": "ノ",
+    "우측 하단 상부": "ハ",
+    "우측 하단": "ナリ",
+    "상단 우측": "ノ", 
+    "좌측 하단 상부": "テ",
+}
+
+gugyeol_grammar_rules = """
+- ト (토): '와/여' (나열 접속조사)
+- ニ (니): '에/에게/으로' (처격 조사)
+- ノ (노): '의/ㅅ' (속격 조사)
+- ヲ (코): '을/를' (목적격 조사)
+- ハ (하): '은/는' (주제 보조사)
+- テ (테): '(하)며/(하)고' (연결어미)
+- ナリ (나리): '(이)다' (종결어미)
+"""
+
+# --- 3. 헬퍼 함수: 이미지 인코딩 ---
+
+def encode_image_to_base64(image_path):
+    """로컬 이미지 파일을 Base64 문자열로 인코딩합니다."""
+    try:
+        with open(image_path, "rb") as image_file:
+            return base64.b64encode(image_file.read()).decode('utf-8')
+    except FileNotFoundError:
+        print(f"오류: 파일 경로를 찾을 수 없습니다 - {image_path}")
+        return None
+    except Exception as e:
+        print(f"이미지 인코딩 중 오류 발생: {e}")
+        return None
+
+# --- 4. 변환기 함수  ---
+
+def analyze_gakpil_image(image_path, model="gpt-4o"):
+    """
+    1단계: AI 비전 모델이 각필 이미지를 분석하여 
+    [('한자', '위치')] 형식의 Python 리스트로 반환합니다.
+    """
+    #print(f"\n[1단계: 이미지 분석 시작 (모델: {model})]...")
+    print(f"\n[1단계: 이미지 분석 시작]...")
+    
+    base64_image = encode_image_to_base64(image_path)
+    if not base64_image:
+        return None
+
+    vision_system_prompt = f"""
+    당신은 신라 시대 '각필 구결' 전문 해독가입니다.
+    사용자가 한자와 그 주변에 점(각필)이 찍힌 이미지를 제공할 것입니다.
+    당신의 임무는 이미지를 주의 깊게 분석하여, 한자를 왼쪽에서 오른쪽으로, 위에서 아래로 순서대로 식별하고,
+    각 한자에 대해 찍힌 점의 상대적인 위치를 [위치 매핑]에 따라 정확히 찾아내는 것입니다.
+
+    [위치 매핑]
+    - 한자의 상단 좌측 모서리: "상단 좌측"
+    - 한자의 중앙 좌측: "중앙 좌측"
+    - 한자의 하단 좌측 모서리: "하단 좌측"
+    - 한자의 상단 중앙: "상단 중앙"
+    - 한자의 우측 상단 모서리: "상단 우측"
+    - 한자의 중앙 우측: "중앙 우측"
+    - 한자의 우측 하단 (위쪽 점): "우측 하단 상부"
+    - 한자의 우측 하단 (아래쪽 점/선): "우측 하단"
+
+    최종 결과물은 다른 설명 없이, 오직 Python 리스트 형식으로만 출력해야 합니다.
+    
+    [출력 형식 예시]
+    [("王", "중앙 좌측"), ("侍", "우측 하단")]
+    """
+
+    try:
+        response = openai.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": vision_system_prompt},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "이 이미지에 있는 각필 구결을 분석하여 Python 리스트 형식으로 반환해줘."},
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{base64_image}"}}
+                    ]
+                }
+            ],
+            max_tokens=300
+        )
+        
+        ai_response_str = response.choices[0].message.content
+        print(f"AI 비전 모델 응답 (Raw): {ai_response_str}")
+        
+        # --- [오류 수정 지점] ---
+        # AI가 ```python ... ``` 같은 마크다운으로 감싸서 응답할 경우 대비
+        # 정규표현식을 사용해 [...] 리스트 부분만 정확히 추출합니다.
+        match = re.search(r"(\[.*\])", ai_response_str, re.DOTALL)
+        
+        if not match:
+            print(f"오류: AI 응답에서 리스트 형식( [...] )을 찾을 수 없습니다: {ai_response_str}")
+            return None
+
+        # 추출한 문자열 (예: '[("王", "중앙 좌측")]')을 파싱
+        list_string_to_parse = match.group(1)
+
+        # AI의 응답(문자열)을 실제 Python 리스트로 안전하게 변환
+        parsed_list = ast.literal_eval(list_string_to_parse) # 수정된 문자열을 파싱
+        
+        if isinstance(parsed_list, list):
+            print("이미지 분석 및 구조화 성공.")
+            return parsed_list
+        else:
+            print("오류: AI가 리스트 형식이 아닌 다른 값을 반환했습니다.")
+            return None
+
+    except openai.AuthenticationError:
+        handle_api_error()
+        return None
+    except SyntaxError: # 파싱 실패 시
+        print(f"오류: AI가 반환한 문자열을 파싱할 수 없습니다 (SyntaxError): {ai_response_str}")
+        return None
+    except Exception as e:
+        print(f"AI 비전 API 호출 중 예기치 않은 오류 발생: {e}")
+        return None
+
+def translate_gakpil_to_korean(input_pairs, model="gpt-4o"):
+    """
+    2단계: 1단계에서 얻은 [('한자', '위치')] 리스트를 
+    자토구결로 변환하고, 다시 AI를 통해 한국어로 번역합니다.
+    """
+    #print(f"\n[2단계: 자토구결 변환 및 한국어 번역 시작 (모델: {model})]...")
+    print(f"\n[2단계: 자토구결 변환 및 한국어 번역 시작]...")
+
+    # --- 2-1. 자토구결 변환 ---
+    jatogugyeol_string = ""
+    for hanja, position in input_pairs:
+        gugyeol = dot_position_map.get(position)
+        
+        if gugyeol:
+            jatogugyeol_string += f"{hanja}{gugyeol} "
+        else:
+            jatogugyeol_string += f"{hanja}({position}?) " 
+    
+    jatogugyeol_output = jatogugyeol_string.strip()
+    
+    if not jatogugyeol_output:
+        return ("입력 없음", "변환할 내용이 없습니다.")
+
+    print(f"자토구결 변환 완료: {jatogugyeol_output}")
+
+    # --- 2-2. OpenAI API로 한국어 번역 (AI 기반) ---
+    
+    translation_system_prompt = f"""
+    당신은 신라 시대 '자토구결'을 현대 한국어로 번역하는 고대 한국어 및 한문 전문가입니다.
+    사용자가 '자토구결' 문자열을 입력하면, 당신은 제공된 [문법 규칙]을 철저히 준수하여
+    각 한자의 의미와 구결의 문법적 기능을 결합한 뒤, 가장 자연스러운 현대 한국어 문장으로 번역해야 합니다.
+
+    [문법 규칙]
+    {gugyeol_grammar_rules}
+
+    [번역 예시]
+    - 입력: 王ヲ 侍ナリ
+    - 분석: 王(왕) + ヲ(을/를) + 侍(모시다) + ナリ(이다/다)
+    - 번역: 왕을 모신다.
+    """
+    
+    user_prompt = f"다음 자토구결을 [문법 규칙]에 따라 번역하시오: {jatogugyeol_output}"
+    
+    try:
+        response = openai.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": translation_system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.2
+        )
+        
+        korean_translation = response.choices[0].message.content
+        print("한국어 번역 성공.")
+        return (jatogugyeol_output, korean_translation)
+        
+    except openai.AuthenticationError:
+        handle_api_error()
+        return (jatogugyeol_output, "API 인증 오류로 번역 실패")
+    except Exception as e:
+        print(f"AI 번역 API 호출 중 예기치 않은 오류 발생: {e}")
+        return (jatogugyeol_output, "번역 중 오류가 발생했습니다.")
+
+def handle_api_error():
+    """API 키 오류 공통 처리"""
+    print("="*60)
+    print("  오류: OpenAI API 키가 유효하지 않거나 설정되지 않았습니다.  ")
+    print("  코드 상단의 'API_KEY' 변수에 실제 키를 입력했는지 확인하세요.  ")
+    print("="*60)
+
+# --- 5. 메인 실행 로직 ---
+if __name__ == "__main__":
+    
+    if API_KEY == "YOUR_OPENAI_API_KEY":
+        handle_api_error()
+    else:
+        print("--- 신라 각필 구결 AI 변환기 ---")
+        
+        image_path = input("▶ 이미지 파일 경로 ㄱㄱ: ").strip().strip('"')
+
+        if not os.path.exists(image_path):
+            print(f"오류: 해당 경로에 파일이 없습니다. ({image_path})")
+        else:
+            analyzed_pairs = analyze_gakpil_image(image_path)
+            
+            if analyzed_pairs:
+                jatogugyeol_result, korean_result = translate_gakpil_to_korean(analyzed_pairs)
+                
+                print("\n" + "="*25 + " [ 최종 변환 결과 ] " + "="*25)
+                print(f" 원본 이미지 파일: {image_path}")
+                print(f" 1. AI 이미지 분석 (구조화): {analyzed_pairs}")
+                print(f" 2. 자토구결 변환 (규칙): {jatogugyeol_result}")
+                print(f" 3. 현대 한국어 번역 (AI): {korean_result}")
+                print("="*68)
+            else:
+                print("이미지 분석에 실패하여 번역을 진행할 수 없습니다.")
